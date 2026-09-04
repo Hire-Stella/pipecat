@@ -36,8 +36,10 @@ from pipecat.utils.tracing.service_decorators import traced_stt
 
 try:
     from azure.cognitiveservices.speech import (
+        AutoDetectSourceLanguageConfig,
         CancellationReason,
         ProfanityOption,
+        PropertyId,
         ResultReason,
         SpeechConfig,
         SpeechRecognizer,
@@ -84,9 +86,18 @@ class AzureSTTSettings(STTSettings):
             containing common substrings), which breaks downstream fuzzy
             matching and LLM reasoning. See `SpeechConfig.set_profanity
             <https://learn.microsoft.com/en-us/python/api/azure-cognitiveservices-speech/azure.cognitiveservices.speech.speechconfig#azure-cognitiveservices-speech-speechconfig-set-profanity>`_.
+        auto_detect_languages: BCP-47 candidate languages (e.g.
+            ``["en-US", "ar-AE", "hi-IN"]``) for continuous language
+            identification. When set (non-empty), the recognizer detects the
+            spoken language among the candidates and follows mid-call
+            switches; ``language`` is ignored. Azure caps the candidate list
+            at 10. ``None``/empty keeps single-language recognition.
     """
 
     profanity: AzureProfanity | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    auto_detect_languages: list[str] | None | _NotGiven = field(
+        default_factory=lambda: NOT_GIVEN
+    )
 
 
 class AzureSTTService(STTService):
@@ -140,6 +151,7 @@ class AzureSTTService(STTService):
             model=None,
             language=Language.EN_US,
             profanity=None,
+            auto_detect_languages=None,
         )
 
         # 2. Apply direct init arg overrides (deprecated)
@@ -160,37 +172,47 @@ class AzureSTTService(STTService):
             **kwargs,
         )
 
-        recognition_language = assert_given(
-            default_settings.language
-        ) or language_to_azure_language(Language.EN_US)
-
         if not region and not private_endpoint:
             raise ValueError("Either 'region' or 'private_endpoint' must be provided.")
 
-        if private_endpoint:
-            if region:
-                logger.warning(
-                    "Both 'region' and 'private_endpoint' provided; 'region' will be ignored."
-                )
-            self._speech_config = SpeechConfig(
-                subscription=api_key,
-                endpoint=private_endpoint,
-                speech_recognition_language=recognition_language,
-            )
-        else:
-            self._speech_config = SpeechConfig(
-                subscription=api_key,
-                region=region,
-                speech_recognition_language=recognition_language,
+        if private_endpoint and region:
+            logger.warning(
+                "Both 'region' and 'private_endpoint' provided; 'region' will be ignored."
             )
 
-        if endpoint_id:
-            self._speech_config.endpoint_id = endpoint_id
-
-        self._apply_profanity()
+        self._api_key = api_key
+        self._region = region
+        self._private_endpoint = private_endpoint
+        self._endpoint_id = endpoint_id
+        self._speech_config = self._create_speech_config()
 
         self._audio_stream = None
         self._speech_recognizer = None
+
+    def _create_speech_config(self) -> "SpeechConfig":
+        """Build a SpeechConfig for the current settings.
+
+        With ``auto_detect_languages`` active the config carries no fixed
+        recognition language — the SDK rejects combining one with an
+        AutoDetectSourceLanguageConfig on the recognizer.
+        """
+        kwargs = {"subscription": self._api_key}
+        if self._private_endpoint:
+            kwargs["endpoint"] = self._private_endpoint
+        else:
+            kwargs["region"] = self._region
+
+        if not assert_given(self._settings.auto_detect_languages):
+            kwargs["speech_recognition_language"] = assert_given(
+                self._settings.language
+            ) or language_to_azure_language(Language.EN_US)
+
+        config = SpeechConfig(**kwargs)
+        if self._endpoint_id:
+            config.endpoint_id = self._endpoint_id
+        self._speech_config = config
+        self._apply_profanity()
+        return config
 
     def can_generate_metrics(self) -> bool:
         """Check if this service can generate performance metrics.
@@ -228,19 +250,14 @@ class AzureSTTService(STTService):
         """Apply a settings delta and reconnect if language or profanity changed."""
         changed = await super()._update_settings(delta)
 
-        if "language" in changed:
-            self._speech_config.speech_recognition_language = assert_given(
-                self._settings.language
-            ) or language_to_azure_language(Language.EN_US)
-
-        if "profanity" in changed:
-            self._apply_profanity()
-
-        # Both settings are baked into the recognizer at connect time, so a
-        # live change only takes effect after a reconnect.
-        if ("language" in changed or "profanity" in changed) and self._audio_stream:
-            await self._disconnect()
-            await self._connect()
+        relevant = {"language", "profanity", "auto_detect_languages"} & set(changed)
+        if relevant:
+            self._create_speech_config()
+            # Settings are baked into the recognizer at connect time, so a
+            # live change only takes effect after a reconnect.
+            if self._audio_stream:
+                await self._disconnect()
+                await self._connect()
 
         return changed
 
@@ -307,8 +324,22 @@ class AzureSTTService(STTService):
 
             audio_config = AudioConfig(stream=self._audio_stream)
 
+            recognizer_kwargs = {}
+            auto_detect_languages = assert_given(self._settings.auto_detect_languages)
+            if auto_detect_languages:
+                # Continuous language identification: detect among the
+                # candidates and follow mid-call language switches.
+                self._speech_config.set_property(
+                    PropertyId.SpeechServiceConnection_LanguageIdMode, "Continuous"
+                )
+                recognizer_kwargs["auto_detect_source_language_config"] = (
+                    AutoDetectSourceLanguageConfig(languages=auto_detect_languages)
+                )
+
             self._speech_recognizer = SpeechRecognizer(
-                speech_config=self._speech_config, audio_config=audio_config
+                speech_config=self._speech_config,
+                audio_config=audio_config,
+                **recognizer_kwargs,
             )
             self._speech_recognizer.recognizing.connect(self._on_handle_recognizing)
             self._speech_recognizer.recognized.connect(self._on_handle_recognized)
