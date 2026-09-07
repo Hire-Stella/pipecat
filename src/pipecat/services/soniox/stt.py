@@ -408,6 +408,9 @@ class SonioxSTTService(WebsocketSTTService):
             **kwargs,
         )
 
+        # Fired once per connection in single-speaker mode with the label kept.
+        self._register_event_handler("on_speaker_locked")
+
         self._api_key = api_key
         self._url = url
         self._vad_force_turn_endpoint = vad_force_turn_endpoint
@@ -588,7 +591,7 @@ class SonioxSTTService(WebsocketSTTService):
         if len(duration) < 2:
             return
         self._locked_speaker = max(duration, key=lambda s: energy[s] / duration[s])
-        logger.debug(f"{self}: single-speaker mode locked onto speaker {self._locked_speaker}")
+        logger.info(f"{self}: single-speaker mode locked onto speaker {self._locked_speaker}")
 
     @traced_stt
     async def _handle_transcription(
@@ -762,6 +765,8 @@ class SonioxSTTService(WebsocketSTTService):
             ):
                 # The first multi-voice turn decides the lock; keep only that speaker's words.
                 self._lock_loudest_speaker()
+                if self._locked_speaker is not None:
+                    await self._call_event_handler("on_speaker_locked", self._locked_speaker)
                 self._final_transcription_buffer = [
                     token
                     for token in self._final_transcription_buffer
