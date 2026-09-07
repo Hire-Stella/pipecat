@@ -13,6 +13,7 @@ from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
 from typing import Any
 
+import numpy as np
 from loguru import logger
 from pydantic import BaseModel
 from websockets.protocol import State
@@ -253,10 +254,11 @@ class SonioxSTTSettings(STTSettings):
             context_version 1 and SonioxContextObject for models with
             context_version 2.
         enable_speaker_diarization: Whether to enable speaker diarization.
-        single_speaker: With diarization enabled, lock onto the first speaker whose
-            tokens finalize and discard every other speaker's tokens, so background
-            voices neither reach the transcript nor open a user turn. Client-side
-            only; nothing is sent to Soniox.
+        single_speaker: With diarization enabled, lock onto the loudest speaker of
+            the first user turn and discard every other speaker's tokens from then
+            on, so background voices neither reach the transcript nor open a user
+            turn. Loudness is the signal energy of the outgoing audio over each
+            speaker's token spans. Client-side only; nothing is sent to Soniox.
         enable_language_identification: Whether to enable language identification.
         max_endpoint_delay_ms: Max ms before endpoint detection finalizes the turn (500-3000).
         endpoint_sensitivity: Endpoint detection sensitivity (-1.0 to 1.0); higher finalizes sooner.
@@ -416,8 +418,11 @@ class SonioxSTTService(WebsocketSTTService):
 
         self._final_transcription_buffer = []
         self._last_tokens_received: float | None = None
-        # Speaker label locked onto in single-speaker mode (see ``_accepts_token``).
+        # Single-speaker mode: audio energy per outgoing chunk (start_ms, end_ms,
+        # rms) collected until the first turn ends and picks the locked speaker.
         self._locked_speaker: str | None = None
+        self._energy_windows: list[tuple[float, float, float]] = []
+        self._audio_ms_sent = 0.0
 
         # Turn tracking for Soniox turn-detection mode.
         self._user_turn_open = False
@@ -537,12 +542,56 @@ class SonioxSTTService(WebsocketSTTService):
             Frame: None (transcription results come via WebSocket callbacks).
         """
         if self._websocket and self._websocket.state is State.OPEN:
+            self._record_energy(audio)
             try:
                 await self._websocket.send(audio)
             except Exception as e:
                 logger.warning(f"{self}: send failed: {e}")
 
         yield None
+
+    def _record_energy(self, audio: bytes) -> None:
+        """Track the stream clock and, while the speaker lock is undecided, chunk loudness."""
+        bytes_per_ms = self.sample_rate * 2 * self._num_channels / 1000
+        if not bytes_per_ms:
+            return
+        start = self._audio_ms_sent
+        self._audio_ms_sent += len(audio) / bytes_per_ms
+        if self._settings.single_speaker and self._locked_speaker is None:
+            samples = np.frombuffer(audio, dtype=np.int16).astype(np.float32)
+            rms = float(np.sqrt(np.mean(np.square(samples)))) if samples.size else 0.0
+            self._energy_windows.append((start, self._audio_ms_sent, rms))
+
+    def _lock_loudest_speaker(self) -> None:
+        """Lock onto the speaker whose token spans carried the most signal energy.
+
+        Runs once, at the end of the first turn that produced labelled tokens.
+        Falls back to the first labelled speaker when tokens carry no timestamps.
+        """
+        energy: dict[str, float] = {}
+        duration: dict[str, float] = {}
+        first_speaker = None
+        # ponytail: tokens x windows scan, a few hundred x a few tens for one turn.
+        for token in self._final_transcription_buffer:
+            speaker = token.get("speaker")
+            if speaker is None:
+                continue
+            if first_speaker is None:
+                first_speaker = speaker
+            start, end = token.get("start_ms"), token.get("end_ms")
+            if start is None or end is None:
+                continue
+            for window_start, window_end, rms in self._energy_windows:
+                overlap = min(end, window_end) - max(start, window_start)
+                if overlap > 0:
+                    energy[speaker] = energy.get(speaker, 0.0) + rms * overlap
+                    duration[speaker] = duration.get(speaker, 0.0) + overlap
+        if duration:
+            self._locked_speaker = max(duration, key=lambda s: energy[s] / duration[s])
+        else:
+            self._locked_speaker = first_speaker
+        self._energy_windows = []
+        logger.debug(f"{self}: single-speaker mode locked onto speaker {self._locked_speaker}")
 
     @traced_stt
     async def _handle_transcription(
@@ -684,24 +733,17 @@ class SonioxSTTService(WebsocketSTTService):
     def _accepts_token(self, token: dict[str, Any]) -> bool:
         """Decide whether a token belongs to the tracked speaker.
 
-        Everything passes unless ``single_speaker`` is on. Then the first
-        finalized token with a speaker label locks that speaker in, and tokens
-        labelled with any other speaker are dropped. Unlabelled tokens always
-        pass, so a stream without diarization behaves as before.
+        Everything passes until single-speaker mode has locked onto a speaker
+        (see ``_lock_loudest_speaker``); after that, tokens labelled with any
+        other speaker are dropped. Unlabelled tokens always pass, so a stream
+        without diarization behaves as before.
         """
-        if not self._settings.single_speaker:
+        if not self._settings.single_speaker or self._locked_speaker is None:
             return True
         speaker = token.get("speaker")
-        if speaker is None:
-            return True
-        if self._locked_speaker is None:
-            if token["is_final"]:
-                self._locked_speaker = speaker
-            return True
-        # ponytail: permanent lock on the first finalized speaker. Real-time
-        # labels can flip briefly and the first voice may be a bystander, both
-        # silently drop caller speech; relock on prolonged silence if that bites.
-        return speaker == self._locked_speaker
+        # ponytail: permanent lock. Real-time labels can flip briefly, which
+        # silently drops caller speech; relock on prolonged silence if that bites.
+        return speaker is None or speaker == self._locked_speaker
 
     async def _receive_messages(self):
         """Receive and process websocket messages.
@@ -711,9 +753,23 @@ class SonioxSTTService(WebsocketSTTService):
         # Transcription frame will be only sent after we get the "endpoint" event.
         self._final_transcription_buffer = []
         self._locked_speaker = None
+        self._energy_windows = []
+        self._audio_ms_sent = 0.0
         label_speakers = not self._settings.single_speaker
 
         async def send_endpoint_transcript():
+            if (
+                self._settings.single_speaker
+                and self._locked_speaker is None
+                and self._final_transcription_buffer
+            ):
+                # The first turn decides the lock; keep only that speaker's words.
+                self._lock_loudest_speaker()
+                self._final_transcription_buffer = [
+                    token
+                    for token in self._final_transcription_buffer
+                    if self._accepts_token(token)
+                ]
             if self._final_transcription_buffer:
                 text = _tokens_to_text(self._final_transcription_buffer, label_speakers)
                 language = _language_from_tokens(self._final_transcription_buffer)
