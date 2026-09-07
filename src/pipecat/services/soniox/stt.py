@@ -193,17 +193,18 @@ def language_to_soniox_language(language: Language) -> str:
     return resolve_language(language, LANGUAGE_MAP, use_base_code=True)
 
 
-def _tokens_to_text(tokens: list[dict[str, Any]]) -> str:
+def _tokens_to_text(tokens: list[dict[str, Any]], label_speakers: bool = True) -> str:
     """Join token texts, prefixing ``@<speaker>: `` wherever the speaker changes.
 
     Tokens carry a ``speaker`` label only when speaker diarization is enabled,
-    so transcripts are unchanged otherwise.
+    so transcripts are unchanged otherwise. ``label_speakers=False`` joins the
+    text without labels, for single-speaker mode where only one speaker remains.
     """
     parts = []
     speaker = None
     for token in tokens:
         text = token["text"]
-        token_speaker = token.get("speaker")
+        token_speaker = token.get("speaker") if label_speakers else None
         if token_speaker is not None and token_speaker != speaker:
             speaker = token_speaker
             parts.append(f"{' ' if parts else ''}@{speaker}: ")
@@ -252,6 +253,10 @@ class SonioxSTTSettings(STTSettings):
             context_version 1 and SonioxContextObject for models with
             context_version 2.
         enable_speaker_diarization: Whether to enable speaker diarization.
+        single_speaker: With diarization enabled, lock onto the first speaker whose
+            tokens finalize and discard every other speaker's tokens, so background
+            voices neither reach the transcript nor open a user turn. Client-side
+            only; nothing is sent to Soniox.
         enable_language_identification: Whether to enable language identification.
         max_endpoint_delay_ms: Max ms before endpoint detection finalizes the turn (500-3000).
         endpoint_sensitivity: Endpoint detection sensitivity (-1.0 to 1.0); higher finalizes sooner.
@@ -269,6 +274,7 @@ class SonioxSTTSettings(STTSettings):
     language_hints_strict: bool | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
     context: SonioxContextObject | str | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
     enable_speaker_diarization: bool | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    single_speaker: bool | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
     enable_language_identification: bool | None | _NotGiven = field(
         default_factory=lambda: NOT_GIVEN
     )
@@ -355,6 +361,7 @@ class SonioxSTTService(WebsocketSTTService):
             language_hints_strict=None,
             context=None,
             enable_speaker_diarization=False,
+            single_speaker=False,
             enable_language_identification=False,
             max_endpoint_delay_ms=None,
             endpoint_sensitivity=None,
@@ -409,6 +416,8 @@ class SonioxSTTService(WebsocketSTTService):
 
         self._final_transcription_buffer = []
         self._last_tokens_received: float | None = None
+        # Speaker label locked onto in single-speaker mode (see ``_accepts_token``).
+        self._locked_speaker: str | None = None
 
         # Turn tracking for Soniox turn-detection mode.
         self._user_turn_open = False
@@ -672,6 +681,28 @@ class SonioxSTTService(WebsocketSTTService):
             return self._websocket
         raise Exception("Websocket not connected")
 
+    def _accepts_token(self, token: dict[str, Any]) -> bool:
+        """Decide whether a token belongs to the tracked speaker.
+
+        Everything passes unless ``single_speaker`` is on. Then the first
+        finalized token with a speaker label locks that speaker in, and tokens
+        labelled with any other speaker are dropped. Unlabelled tokens always
+        pass, so a stream without diarization behaves as before.
+        """
+        if not self._settings.single_speaker:
+            return True
+        speaker = token.get("speaker")
+        if speaker is None:
+            return True
+        if self._locked_speaker is None:
+            if token["is_final"]:
+                self._locked_speaker = speaker
+            return True
+        # ponytail: permanent lock on the first finalized speaker. Real-time
+        # labels can flip briefly and the first voice may be a bystander, both
+        # silently drop caller speech; relock on prolonged silence if that bites.
+        return speaker == self._locked_speaker
+
     async def _receive_messages(self):
         """Receive and process websocket messages.
 
@@ -679,10 +710,12 @@ class SonioxSTTService(WebsocketSTTService):
         """
         # Transcription frame will be only sent after we get the "endpoint" event.
         self._final_transcription_buffer = []
+        self._locked_speaker = None
+        label_speakers = not self._settings.single_speaker
 
         async def send_endpoint_transcript():
             if self._final_transcription_buffer:
-                text = _tokens_to_text(self._final_transcription_buffer)
+                text = _tokens_to_text(self._final_transcription_buffer, label_speakers)
                 language = _language_from_tokens(self._final_transcription_buffer)
                 # Report usage before the transcription frame so tracing can
                 # attach it to the STT span the frame closes.
@@ -725,6 +758,8 @@ class SonioxSTTService(WebsocketSTTService):
                 non_final_transcription = []
 
                 for token in tokens:
+                    if not self._accepts_token(token):
+                        continue
                     if not is_end_token(token):
                         # In Soniox turn-detection mode, the first token of a new
                         # turn opens it (no-op in Pipecat mode or when a VAD
@@ -748,7 +783,8 @@ class SonioxSTTService(WebsocketSTTService):
                             # Even final tokens are sent as interim tokens as we want to send
                             # nicely formatted messages - therefore waiting for the endpoint.
                             text=_tokens_to_text(
-                                self._final_transcription_buffer + non_final_transcription
+                                self._final_transcription_buffer + non_final_transcription,
+                                label_speakers,
                             ),
                             user_id=self._user_id,
                             timestamp=time_now_iso8601(),
