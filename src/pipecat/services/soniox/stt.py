@@ -193,6 +193,25 @@ def language_to_soniox_language(language: Language) -> str:
     return resolve_language(language, LANGUAGE_MAP, use_base_code=True)
 
 
+def _tokens_to_text(tokens: list[dict[str, Any]]) -> str:
+    """Join token texts, prefixing ``@<speaker>: `` wherever the speaker changes.
+
+    Tokens carry a ``speaker`` label only when speaker diarization is enabled,
+    so transcripts are unchanged otherwise.
+    """
+    parts = []
+    speaker = None
+    for token in tokens:
+        text = token["text"]
+        token_speaker = token.get("speaker")
+        if token_speaker is not None and token_speaker != speaker:
+            speaker = token_speaker
+            parts.append(f"{' ' if parts else ''}@{speaker}: ")
+            text = text.lstrip()
+        parts.append(text)
+    return "".join(parts)
+
+
 def _prepare_language_hints(
     language_hints: list[Language] | None,
 ) -> list[str] | None:
@@ -663,7 +682,7 @@ class SonioxSTTService(WebsocketSTTService):
 
         async def send_endpoint_transcript():
             if self._final_transcription_buffer:
-                text = "".join(map(lambda token: token["text"], self._final_transcription_buffer))
+                text = _tokens_to_text(self._final_transcription_buffer)
                 language = _language_from_tokens(self._final_transcription_buffer)
                 # Report usage before the transcription frame so tracing can
                 # attach it to the STT span the frame closes.
@@ -724,18 +743,13 @@ class SonioxSTTService(WebsocketSTTService):
                         non_final_transcription.append(token)
 
                 if self._final_transcription_buffer or non_final_transcription:
-                    final_text = "".join(
-                        map(lambda token: token["text"], self._final_transcription_buffer)
-                    )
-                    non_final_text = "".join(
-                        map(lambda token: token["text"], non_final_transcription)
-                    )
-
                     await self.push_frame(
                         InterimTranscriptionFrame(
                             # Even final tokens are sent as interim tokens as we want to send
                             # nicely formatted messages - therefore waiting for the endpoint.
-                            text=final_text + non_final_text,
+                            text=_tokens_to_text(
+                                self._final_transcription_buffer + non_final_transcription
+                            ),
                             user_id=self._user_id,
                             timestamp=time_now_iso8601(),
                             result=self._final_transcription_buffer + non_final_transcription,
