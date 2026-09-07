@@ -254,11 +254,12 @@ class SonioxSTTSettings(STTSettings):
             context_version 1 and SonioxContextObject for models with
             context_version 2.
         enable_speaker_diarization: Whether to enable speaker diarization.
-        single_speaker: With diarization enabled, lock onto the loudest speaker of
-            the first user turn and discard every other speaker's tokens from then
-            on, so background voices neither reach the transcript nor open a user
-            turn. Loudness is the signal energy of the outgoing audio over each
-            speaker's token spans. Client-side only; nothing is sent to Soniox.
+        single_speaker: With diarization enabled, lock onto the loudest speaker the
+            first time a turn contains two or more voices and discard every other
+            speaker's tokens from then on, so background voices neither reach the
+            transcript nor open a user turn. Loudness is the signal energy of the
+            outgoing audio over each speaker's token spans. Client-side only;
+            nothing is sent to Soniox.
         enable_language_identification: Whether to enable language identification.
         max_endpoint_delay_ms: Max ms before endpoint detection finalizes the turn (500-3000).
         endpoint_sensitivity: Endpoint detection sensitivity (-1.0 to 1.0); higher finalizes sooner.
@@ -565,32 +566,28 @@ class SonioxSTTService(WebsocketSTTService):
     def _lock_loudest_speaker(self) -> None:
         """Lock onto the speaker whose token spans carried the most signal energy.
 
-        Runs once, at the end of the first turn that produced labelled tokens.
-        Falls back to the first labelled speaker when tokens carry no timestamps.
+        Runs at the end of each turn until it locks. A turn only decides the
+        lock when at least two speakers with timestamped tokens were heard in
+        it; a lone speaker has nothing to be compared against and passes through
+        unfiltered, so a bystander talking alone cannot become the lock.
         """
         energy: dict[str, float] = {}
         duration: dict[str, float] = {}
-        first_speaker = None
         # ponytail: tokens x windows scan, a few hundred x a few tens for one turn.
         for token in self._final_transcription_buffer:
             speaker = token.get("speaker")
-            if speaker is None:
-                continue
-            if first_speaker is None:
-                first_speaker = speaker
             start, end = token.get("start_ms"), token.get("end_ms")
-            if start is None or end is None:
+            if speaker is None or start is None or end is None:
                 continue
             for window_start, window_end, rms in self._energy_windows:
                 overlap = min(end, window_end) - max(start, window_start)
                 if overlap > 0:
                     energy[speaker] = energy.get(speaker, 0.0) + rms * overlap
                     duration[speaker] = duration.get(speaker, 0.0) + overlap
-        if duration:
-            self._locked_speaker = max(duration, key=lambda s: energy[s] / duration[s])
-        else:
-            self._locked_speaker = first_speaker
         self._energy_windows = []
+        if len(duration) < 2:
+            return
+        self._locked_speaker = max(duration, key=lambda s: energy[s] / duration[s])
         logger.debug(f"{self}: single-speaker mode locked onto speaker {self._locked_speaker}")
 
     @traced_stt
@@ -763,7 +760,7 @@ class SonioxSTTService(WebsocketSTTService):
                 and self._locked_speaker is None
                 and self._final_transcription_buffer
             ):
-                # The first turn decides the lock; keep only that speaker's words.
+                # The first multi-voice turn decides the lock; keep only that speaker's words.
                 self._lock_loudest_speaker()
                 self._final_transcription_buffer = [
                     token
