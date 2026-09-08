@@ -680,7 +680,8 @@ class SonioxSTTService(WebsocketSTTService):
             # full network round-trip plus model TTFB later and remains the
             # fallback when no VAD analyzer is configured. No-op in Pipecat
             # mode or mid-turn.
-            await self._user_turn_started()
+            if self._vad_passes_level(frame.start_secs):
+                await self._user_turn_started()
         elif isinstance(frame, VADUserStoppedSpeakingFrame) and self._vad_force_turn_endpoint:
             # Send finalize message to Soniox so we get the final tokens asap.
             if self._websocket and self._websocket.state is State.OPEN:
@@ -794,6 +795,21 @@ class SonioxSTTService(WebsocketSTTService):
         if self._websocket:
             return self._websocket
         raise Exception("Websocket not connected")
+
+    def _vad_passes_level(self, start_secs: float | None) -> bool:
+        """Whether speech the local VAD just detected may open a turn.
+
+        Once single-speaker mode has locked, a VAD start alone would let any
+        voice in the room interrupt the bot before Soniox has labelled a word.
+        The audio behind the VAD decision is compared with the caller's running
+        level; a quieter voice is left to the token path, which also knows its
+        label. Before the lock, or without a level reading, the fast path stays.
+        """
+        if not self._settings.single_speaker or self._locked_speaker is None:
+            return True
+        window_ms = (start_secs or 0.35) * 1000
+        level = self._level_between(self._audio_ms_sent - window_ms, self._audio_ms_sent)
+        return self._passes_level("", level)
 
     def _accepts_token(self, token: dict[str, Any]) -> bool:
         """Decide whether an interim token may open a turn and show as interim text.
