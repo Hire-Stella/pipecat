@@ -5,8 +5,9 @@
 #
 
 import json
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, PropertyMock, patch
 
+import numpy as np
 import pytest
 from websockets.protocol import State
 
@@ -21,7 +22,12 @@ from pipecat.frames.frames import (
     VADUserStoppedSpeakingFrame,
 )
 from pipecat.processors.frame_processor import FrameDirection
-from pipecat.services.soniox.stt import END_TOKEN, SonioxSTTService, _language_from_tokens
+from pipecat.services.soniox.stt import (
+    END_TOKEN,
+    SonioxSTTService,
+    SonioxSTTSettings,
+    _language_from_tokens,
+)
 from pipecat.transcriptions.language import Language
 from pipecat.turns.user_turn_strategies import ExternalUserTurnStrategies
 from pipecat.utils.asyncio.task_manager import TaskManager
@@ -591,3 +597,36 @@ async def test_stop_completes_teardown_when_the_end_of_audio_send_fails():
     service._flush_stt_usage_metrics.assert_awaited_once()
     assert service._disconnecting is True
     assert websocket.closed
+
+
+@pytest.mark.asyncio
+async def test_locked_single_speaker_vad_start_needs_caller_level(monkeypatch):
+    """After the lock, the VAD fast path opens a turn only for speech near the caller's level."""
+    events = []
+    service = _instrumented_service(
+        monkeypatch,
+        events,
+        vad_force_turn_endpoint=False,
+        settings=SonioxSTTSettings(enable_speaker_diarization=True, single_speaker=True),
+    )
+    service._locked_speaker = "1"
+    service._caller_level = 2000.0
+
+    def feed(amplitude, ms):
+        chunk = (np.full(8 * ms, amplitude, dtype=np.int16)).tobytes()
+        service._record_energy(chunk)
+
+    with patch.object(type(service), "sample_rate", new_callable=PropertyMock, return_value=8000):
+        feed(200, 400)  # a quiet bystander: 10% of the caller's level
+        await service.process_frame(
+            VADUserStartedSpeakingFrame(start_secs=0.35), FrameDirection.DOWNSTREAM
+        )
+        assert ("broadcast", ProposedUserStartedSpeakingFrame) not in events
+        assert service._user_turn_open is False
+
+        feed(1500, 400)  # the caller again
+        await service.process_frame(
+            VADUserStartedSpeakingFrame(start_secs=0.35), FrameDirection.DOWNSTREAM
+        )
+        assert ("broadcast", ProposedUserStartedSpeakingFrame) in events
+        assert service._user_turn_open is True
