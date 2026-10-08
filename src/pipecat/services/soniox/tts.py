@@ -625,6 +625,10 @@ class SonioxTTSService(WebsocketTTSService):
                 await self._connect()
 
             try:
+                # The eager config send at turn start does not survive a
+                # reconnect (``_disconnect_websocket`` clears the set), and
+                # Soniox rejects text for a stream it has not seen. Idempotent.
+                await self._send_config(context_id)
                 text_msg = {"text": text, "text_end": False, "stream_id": context_id}
                 await self._get_websocket().send(json.dumps(text_msg))
                 await self.start_tts_usage_metrics(text)
