@@ -243,7 +243,9 @@ class HuggingFaceSTTService(SegmentedSTTService):
             # The setting may hold a plain code; the frame only takes the enum.
             language = raw_language if isinstance(raw_language, Language) else None
 
-            await self._handle_transcription(text, True, str(raw_language) if raw_language else None)
+            await self._handle_transcription(
+                text, True, str(raw_language) if raw_language else None
+            )
             logger.debug(f"Transcription: [{text}]")
 
             yield TranscriptionFrame(
