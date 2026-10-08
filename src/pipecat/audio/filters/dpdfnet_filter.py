@@ -22,6 +22,7 @@ stream.
 """
 
 import os
+from typing import Any
 
 import numpy as np
 from loguru import logger
@@ -109,7 +110,7 @@ class DPDFNetFilter(BaseAudioFilter):
         self._ready = False
         self._sample_rate = 0
 
-        self._session = None
+        self._session: Any = None
         self._model_sample_rate = 0
         self._in_spec_name = ""
         self._in_state_name = ""
@@ -180,6 +181,8 @@ class DPDFNetFilter(BaseAudioFilter):
 
     def _load_model(self):
         """Create the ONNX session and derive the streaming parameters from it."""
+        # start() only calls this once onnxruntime imported and the path checked.
+        assert ort is not None and self._model_path
         options = ort.SessionOptions()
         # One thread per stream: many concurrent calls share the box, and the
         # per-frame tensors are far too small to gain from intra-op threading.
@@ -310,6 +313,10 @@ class DPDFNetFilter(BaseAudioFilter):
         Returns:
             The enhanced samples committed by overlap-add, possibly empty.
         """
+        # Both are set by _load_model / _reset_stream_state before _ready. The
+        # local alias keeps the narrowed type across the in-place updates below.
+        assert self._window is not None and self._out_buffer is not None
+        out_buffer = self._out_buffer
         self._in_buffer = np.concatenate([self._in_buffer, samples])
         committed: list[np.ndarray] = []
 
@@ -326,12 +333,12 @@ class DPDFNetFilter(BaseAudioFilter):
 
             real_imag = spec_out[0, 0]
             frame = np.fft.irfft(real_imag[:, 0] + 1j * real_imag[:, 1], n=self._win_len)
-            self._out_buffer += (frame * self._window).astype(np.float32)
+            out_buffer += (frame * self._window).astype(np.float32)
 
             # The window satisfies COLA at 50% overlap, so one hop is final.
-            committed.append(self._out_buffer[: self._hop_size].copy())
-            self._out_buffer[: self._win_len - self._hop_size] = self._out_buffer[self._hop_size :]
-            self._out_buffer[self._win_len - self._hop_size :] = 0.0
+            committed.append(out_buffer[: self._hop_size].copy())
+            out_buffer[: self._win_len - self._hop_size] = out_buffer[self._hop_size :]
+            out_buffer[self._win_len - self._hop_size :] = 0.0
             self._in_buffer = self._in_buffer[self._hop_size :]
 
         if not committed:
