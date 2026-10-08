@@ -55,6 +55,10 @@ from pipecat.utils.frame_queue import FrameQueue
 from pipecat.utils.time import nanoseconds_to_seconds
 
 BOT_VAD_STOP_SECS = 0.35
+# Default for TransportParams.bot_vad_stop_secs, the fallback window after the
+# last audio frame before the bot is marked as done when no TTSStoppedFrame
+# arrives. Kept under upstream's name for transports that import it.
+BOT_VAD_STOP_FALLBACK_SECS = 3.0
 
 
 class BaseOutputTransport(FrameProcessor):
