@@ -4,8 +4,16 @@
 # SPDX-License-Identifier: BSD 2-Clause License
 #
 
+import asyncio
+import json
+import unittest
+
+from websockets.protocol import State
+
+from pipecat.frames.frames import LLMFullResponseEndFrame, LLMFullResponseStartFrame, TextFrame
 from pipecat.services.settings import TTSSettings
 from pipecat.services.soniox.tts import SonioxTTSService
+from pipecat.tests.utils import SleepFrame, run_test
 from pipecat.utils.context.word_completion_tracker import WordCompletionTracker
 from pipecat.utils.string import TextPartForConcatenation, concatenate_aggregated_text
 
@@ -137,3 +145,93 @@ def test_soniox_japanese_punctuation_recovered_by_word_tracker():
 
     assert complete
     assert tracker.get_accumulated_user_facing_text() == text
+
+
+def test_soniox_separates_consecutive_sentences_with_a_space():
+    """Every run_tts payload is appended to one Soniox stream, so the text the
+    server sees is the concatenation of all sentences in a turn. Without a
+    trailing space they arrive glued ("Sam.Who"), and Soniox's normalizer reads
+    the period as the literal word "dot" instead of a sentence break.
+    """
+    import re
+
+    service = SonioxTTSService(api_key="not-a-real-key")
+    sentences = [
+        "Hello, thanks for calling.",
+        "My name is Sam.",
+        "Who do I have the pleasure of speaking with today?",
+    ]
+
+    wire = "".join(service._prepare_text_for_tts(s) for s in sentences)
+
+    assert "Sam. Who" in wire
+    assert not re.search(r"\w\.\w", wire), f"sentences glued on the wire: {wire!r}"
+
+
+class _FakeSonioxWebSocket:
+    """Stands in for the websockets connection: records sends, never replies."""
+
+    def __init__(self):
+        self.sent: list[dict] = []
+        self.state = State.OPEN
+        self._closed = asyncio.Event()
+
+    async def send(self, raw: str):
+        self.sent.append(json.loads(raw))
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        await self._closed.wait()
+        raise StopAsyncIteration
+
+    async def close(self):
+        self.state = State.CLOSED
+        self._closed.set()
+
+
+class TestSonioxStreamConfig(unittest.IsolatedAsyncioTestCase):
+    async def test_run_tts_configures_a_stream_the_connection_has_not_seen(self):
+        """The eager config send at turn start does not survive a reconnect:
+        ``_disconnect_websocket`` clears ``_configured_contexts``. Text for the
+        stream must then be preceded by a fresh config, or Soniox rejects it
+        with ``invalid_stream_state`` and the turn produces no audio."""
+        ws = _FakeSonioxWebSocket()
+        service = SonioxTTSService(api_key="not-a-real-key")
+
+        async def fake_connect(url):
+            return ws
+
+        service._websocket_connect = fake_connect
+        cleared_at: list[int] = []
+
+        async def drop_config_like_a_reconnect():
+            while not any("model" in m for m in ws.sent):
+                await asyncio.sleep(0.01)
+            service._configured_contexts.clear()
+            cleared_at.append(len(ws.sent))
+
+        driver = asyncio.create_task(drop_config_like_a_reconnect())
+        try:
+            await run_test(
+                service,
+                frames_to_send=[
+                    LLMFullResponseStartFrame(),
+                    SleepFrame(sleep=0.2),
+                    TextFrame("Hello there."),
+                    LLMFullResponseEndFrame(),
+                    SleepFrame(sleep=0.2),
+                ],
+            )
+        finally:
+            driver.cancel()
+
+        self.assertEqual(len(cleared_at), 1, ws.sent)
+        after_clear = ws.sent[cleared_at[0] :]
+        first_text = next(i for i, m in enumerate(after_clear) if m.get("text"))
+        stream_id = after_clear[first_text]["stream_id"]
+        configs_before_text = [
+            m for m in after_clear[:first_text] if "model" in m and m["stream_id"] == stream_id
+        ]
+        self.assertEqual(len(configs_before_text), 1, after_clear)

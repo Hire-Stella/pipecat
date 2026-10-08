@@ -13,6 +13,7 @@ from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
 from typing import Any
 
+import numpy as np
 from loguru import logger
 from pydantic import BaseModel
 from websockets.protocol import State
@@ -47,6 +48,18 @@ FINALIZE_MESSAGE = '{"type": "finalize"}'
 END_TOKEN = "<end>"
 
 FINALIZED_TOKEN = "<fin>"
+
+# Single-speaker mode: speech from a non-locked label is kept when its level is
+# at least this fraction of the caller's running level. Chosen on crowded-room
+# recordings where 0.5 never dropped the caller's words while removing the
+# clearly quieter bystanders.
+SINGLE_SPEAKER_LEVEL_RATIO = 0.5
+# How much outgoing audio to keep energy readings for; Soniox finalizes tokens
+# within a few seconds of the speech they cover.
+ENERGY_HISTORY_MS = 30_000
+# Finalized speech each of the first two voices must have produced before the
+# lock is decided between them, so a single loud word cannot outvote a caller.
+MIN_LOCK_SPEECH_MS = 1_500
 
 
 class SonioxContextGeneralItem(BaseModel):
@@ -193,6 +206,26 @@ def language_to_soniox_language(language: Language) -> str:
     return resolve_language(language, LANGUAGE_MAP, use_base_code=True)
 
 
+def _tokens_to_text(tokens: list[dict[str, Any]], label_speakers: bool = True) -> str:
+    """Join token texts, prefixing ``@<speaker>: `` wherever the speaker changes.
+
+    Tokens carry a ``speaker`` label only when speaker diarization is enabled,
+    so transcripts are unchanged otherwise. ``label_speakers=False`` joins the
+    text without labels, for single-speaker mode where only one speaker remains.
+    """
+    parts = []
+    speaker = None
+    for token in tokens:
+        text = token["text"]
+        token_speaker = token.get("speaker") if label_speakers else None
+        if token_speaker is not None and token_speaker != speaker:
+            speaker = token_speaker
+            parts.append(f"{' ' if parts else ''}@{speaker}: ")
+            text = text.lstrip()
+        parts.append(text)
+    return "".join(parts)
+
+
 def _prepare_language_hints(
     language_hints: list[Language] | None,
 ) -> list[str] | None:
@@ -233,6 +266,14 @@ class SonioxSTTSettings(STTSettings):
             context_version 1 and SonioxContextObject for models with
             context_version 2.
         enable_speaker_diarization: Whether to enable speaker diarization.
+        single_speaker: With diarization enabled, lock onto the louder of the first
+            two voices heard and from then on drop speech from other labels that is
+            clearly quieter than the caller, so distant background voices neither
+            reach the transcript nor open a user turn. Speech as loud as the caller
+            is kept whatever its label, since real-time labels flip; two people at
+            the same distance from the microphone therefore cannot be separated.
+            Loudness is the signal energy of the outgoing audio over each span.
+            Client-side only; nothing is sent to Soniox.
         enable_language_identification: Whether to enable language identification.
         max_endpoint_delay_ms: Max ms before endpoint detection finalizes the turn (500-3000).
         endpoint_sensitivity: Endpoint detection sensitivity (-1.0 to 1.0); higher finalizes sooner.
@@ -250,6 +291,7 @@ class SonioxSTTSettings(STTSettings):
     language_hints_strict: bool | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
     context: SonioxContextObject | str | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
     enable_speaker_diarization: bool | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    single_speaker: bool | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
     enable_language_identification: bool | None | _NotGiven = field(
         default_factory=lambda: NOT_GIVEN
     )
@@ -336,6 +378,7 @@ class SonioxSTTService(WebsocketSTTService):
             language_hints_strict=None,
             context=None,
             enable_speaker_diarization=False,
+            single_speaker=False,
             enable_language_identification=False,
             max_endpoint_delay_ms=None,
             endpoint_sensitivity=None,
@@ -379,6 +422,9 @@ class SonioxSTTService(WebsocketSTTService):
             **kwargs,
         )
 
+        # Fired once per connection in single-speaker mode with the label kept.
+        self._register_event_handler("on_speaker_locked")
+
         self._api_key = api_key
         self._url = url
         self._vad_force_turn_endpoint = vad_force_turn_endpoint
@@ -390,6 +436,15 @@ class SonioxSTTService(WebsocketSTTService):
 
         self._final_transcription_buffer = []
         self._last_tokens_received: float | None = None
+        # Single-speaker mode: audio power per outgoing chunk (start_ms, end_ms,
+        # mean square), the locked label and the caller's running level (see
+        # ``_decide_segment``).
+        self._locked_speaker: str | None = None
+        self._caller_level: float | None = None
+        # label -> [energy-weighted level sum, speech ms], until the lock is decided.
+        self._speaker_levels: dict[str, list[float]] = {}
+        self._energy_windows: list[tuple[float, float, float]] = []
+        self._audio_ms_sent = 0.0
 
         # Turn tracking for Soniox turn-detection mode.
         self._user_turn_open = False
@@ -509,12 +564,102 @@ class SonioxSTTService(WebsocketSTTService):
             Frame: None (transcription results come via WebSocket callbacks).
         """
         if self._websocket and self._websocket.state is State.OPEN:
+            self._record_energy(audio)
             try:
                 await self._websocket.send(audio)
             except Exception as e:
                 logger.warning(f"{self}: send failed: {e}")
 
         yield None
+
+    def _record_energy(self, audio: bytes) -> None:
+        """Track the stream clock and, in single-speaker mode, per-chunk loudness."""
+        bytes_per_ms = self.sample_rate * 2 * self._num_channels / 1000
+        if not bytes_per_ms:
+            return
+        start = self._audio_ms_sent
+        self._audio_ms_sent += len(audio) / bytes_per_ms
+        if self._settings.single_speaker:
+            samples = np.frombuffer(audio, dtype=np.int16).astype(np.float32)
+            power = float(np.mean(np.square(samples))) if samples.size else 0.0
+            self._energy_windows.append((start, self._audio_ms_sent, power))
+            # Soniox finalizes tokens within a few seconds; keep a generous tail.
+            horizon = self._audio_ms_sent - ENERGY_HISTORY_MS
+            while self._energy_windows and self._energy_windows[0][1] < horizon:
+                self._energy_windows.pop(0)
+
+    def _level_between(self, start_ms: float, end_ms: float) -> float | None:
+        """RMS of the outgoing audio over a span, or None if that audio was not seen."""
+        energy = duration = 0.0
+        for window_start, window_end, power in self._energy_windows:
+            overlap = min(end_ms, window_end) - max(start_ms, window_start)
+            if overlap > 0:
+                energy += power * overlap
+                duration += overlap
+        return float(np.sqrt(energy / duration)) if duration else None
+
+    def _passes_level(self, speaker: str, level: float | None) -> bool:
+        """Apply the loudness cross-check to a labelled span once locked.
+
+        Speech carrying the caller's label always passes: callers speak softly
+        too, and dropping their quiet words costs more than the odd mislabelled
+        bystander it would catch. Labels flip on real-time audio, so speech from
+        another label is kept when it is at least SINGLE_SPEAKER_LEVEL_RATIO of
+        the caller's running level (most likely the caller mislabelled) and
+        dropped when clearly quieter (a distant voice). Unmeasured spans pass.
+        """
+        if speaker == self._locked_speaker or level is None or self._caller_level is None:
+            return True
+        return level >= SINGLE_SPEAKER_LEVEL_RATIO * self._caller_level
+
+    def _decide_segment(self) -> bool:
+        """Lock or judge the finalized segment in the buffer. Returns whether to keep it.
+
+        The lock is decided once two different labels have been heard in
+        separate segments: the label with the louder average level is kept as
+        the caller. A lone label never locks, so a bystander talking alone
+        before the caller cannot become the lock. Segments before the lock pass.
+        """
+        tokens = [
+            t
+            for t in self._final_transcription_buffer
+            if t.get("speaker") is not None and t.get("start_ms") is not None
+        ]
+        if not tokens:
+            return True
+        speaker = Counter(t["speaker"] for t in tokens).most_common(1)[0][0]
+        start_ms, end_ms = tokens[0]["start_ms"], tokens[-1]["end_ms"]
+        level = self._level_between(start_ms, end_ms)
+        if level is None:
+            return True
+        if self._locked_speaker is None:
+            totals = self._speaker_levels.setdefault(speaker, [0.0, 0.0])
+            totals[0] += level * (end_ms - start_ms)
+            totals[1] += end_ms - start_ms
+            # Both voices must have said enough for their levels to mean anything;
+            # one loud word must not outvote a caller's quiet sentence.
+            heard = {
+                s: e / d for s, (e, d) in self._speaker_levels.items() if d >= MIN_LOCK_SPEECH_MS
+            }
+            if len(heard) < 2:
+                return True
+            # ponytail: permanent lock; relock on prolonged silence if that bites.
+            locked = max(heard, key=lambda s: heard[s])
+            self._locked_speaker = locked
+            self._caller_level = heard[locked]
+            logger.info(f"{self}: single-speaker mode locked onto speaker {locked}")
+        keep = self._passes_level(speaker, level)
+        # Track the caller's level only from speech clearly at their level, so a
+        # quiet mislabelled bystander that slipped through cannot drag it down.
+        caller_level = self._caller_level
+        if (
+            keep
+            and caller_level is not None
+            and speaker == self._locked_speaker
+            and level >= SINGLE_SPEAKER_LEVEL_RATIO * caller_level
+        ):
+            self._caller_level = 0.8 * caller_level + 0.2 * level
+        return keep
 
     @traced_stt
     async def _handle_transcription(
@@ -538,7 +683,8 @@ class SonioxSTTService(WebsocketSTTService):
             # full network round-trip plus model TTFB later and remains the
             # fallback when no VAD analyzer is configured. No-op in Pipecat
             # mode or mid-turn.
-            await self._user_turn_started()
+            if self._vad_passes_level(frame.start_secs):
+                await self._user_turn_started()
         elif isinstance(frame, VADUserStoppedSpeakingFrame) and self._vad_force_turn_endpoint:
             # Send finalize message to Soniox so we get the final tokens asap.
             if self._websocket and self._websocket.state is State.OPEN:
@@ -653,6 +799,38 @@ class SonioxSTTService(WebsocketSTTService):
             return self._websocket
         raise Exception("Websocket not connected")
 
+    def _vad_passes_level(self, start_secs: float | None) -> bool:
+        """Whether speech the local VAD just detected may open a turn.
+
+        Once single-speaker mode has locked, a VAD start alone would let any
+        voice in the room interrupt the bot before Soniox has labelled a word.
+        The audio behind the VAD decision is compared with the caller's running
+        level; a quieter voice is left to the token path, which also knows its
+        label. Before the lock, or without a level reading, the fast path stays.
+        """
+        if not self._settings.single_speaker or self._locked_speaker is None:
+            return True
+        window_ms = (start_secs or 0.35) * 1000
+        level = self._level_between(self._audio_ms_sent - window_ms, self._audio_ms_sent)
+        return self._passes_level("", level)
+
+    def _accepts_token(self, token: dict[str, Any]) -> bool:
+        """Decide whether an interim token may open a turn and show as interim text.
+
+        Everything passes until single-speaker mode has locked onto a speaker
+        (see ``_decide_segment``). After that a token from another label passes
+        only when the audio heard since it started is about as loud as the
+        caller. Finalized tokens are not judged here; the whole segment is
+        judged at the endpoint by ``_decide_segment``. Unlabelled or untimed
+        tokens always pass, so a stream without diarization behaves as before.
+        """
+        if not self._settings.single_speaker or self._locked_speaker is None:
+            return True
+        speaker, start = token.get("speaker"), token.get("start_ms")
+        if speaker is None or start is None:
+            return True
+        return self._passes_level(speaker, self._level_between(start, self._audio_ms_sent))
+
     async def _receive_messages(self):
         """Receive and process websocket messages.
 
@@ -660,10 +838,27 @@ class SonioxSTTService(WebsocketSTTService):
         """
         # Transcription frame will be only sent after we get the "endpoint" event.
         self._final_transcription_buffer = []
+        self._locked_speaker = None
+        self._caller_level = None
+        self._speaker_levels = {}
+        self._energy_windows = []
+        self._audio_ms_sent = 0.0
+        label_speakers = not self._settings.single_speaker
 
         async def send_endpoint_transcript():
+            if self._settings.single_speaker and self._final_transcription_buffer:
+                was_locked = self._locked_speaker is not None
+                keep = self._decide_segment()
+                if not was_locked and self._locked_speaker is not None:
+                    await self._call_event_handler("on_speaker_locked", self._locked_speaker)
+                if not keep:
+                    self._final_transcription_buffer = []
+                elif not self._user_turn_open:
+                    # Kept on loudness after its interim tokens were refused: open
+                    # the turn now so the transcript lands inside a user turn.
+                    await self._user_turn_started()
             if self._final_transcription_buffer:
-                text = "".join(map(lambda token: token["text"], self._final_transcription_buffer))
+                text = _tokens_to_text(self._final_transcription_buffer, label_speakers)
                 language = _language_from_tokens(self._final_transcription_buffer)
                 # Report usage before the transcription frame so tracing can
                 # attach it to the STT span the frame closes.
@@ -706,11 +901,17 @@ class SonioxSTTService(WebsocketSTTService):
                 non_final_transcription = []
 
                 for token in tokens:
-                    if not is_end_token(token):
+                    accepted = self._accepts_token(token)
+                    if not accepted and not token["is_final"]:
+                        # A locked-out voice neither shows as interim text nor opens a turn.
+                        continue
+                    if accepted and not is_end_token(token):
                         # In Soniox turn-detection mode, the first token of a new
                         # turn opens it (no-op in Pipecat mode or when a VAD
                         # signal already opened the turn).
                         await self._user_turn_started()
+                    # Finalized tokens always reach the buffer; the whole segment is
+                    # judged at the endpoint (see _decide_segment).
                     if token["is_final"]:
                         if is_end_token(token):
                             # Found an endpoint, tokens until here will be sent as transcript,
@@ -724,18 +925,14 @@ class SonioxSTTService(WebsocketSTTService):
                         non_final_transcription.append(token)
 
                 if self._final_transcription_buffer or non_final_transcription:
-                    final_text = "".join(
-                        map(lambda token: token["text"], self._final_transcription_buffer)
-                    )
-                    non_final_text = "".join(
-                        map(lambda token: token["text"], non_final_transcription)
-                    )
-
                     await self.push_frame(
                         InterimTranscriptionFrame(
                             # Even final tokens are sent as interim tokens as we want to send
                             # nicely formatted messages - therefore waiting for the endpoint.
-                            text=final_text + non_final_text,
+                            text=_tokens_to_text(
+                                self._final_transcription_buffer + non_final_transcription,
+                                label_speakers,
+                            ),
                             user_id=self._user_id,
                             timestamp=time_now_iso8601(),
                             result=self._final_transcription_buffer + non_final_transcription,

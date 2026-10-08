@@ -56,6 +56,10 @@ from pipecat.utils.frame_queue import FrameQueue
 from pipecat.utils.time import nanoseconds_to_seconds
 
 BOT_VAD_STOP_SECS = 0.35
+# Default for TransportParams.bot_vad_stop_secs, the fallback window after the
+# last audio frame before the bot is marked as done when no TTSStoppedFrame
+# arrives. Kept under upstream's name for transports that import it.
+BOT_VAD_STOP_FALLBACK_SECS = 3.0
 DRAIN_POLL_SECS = 0.25
 
 
@@ -888,28 +892,44 @@ class BaseOutputTransport(FrameProcessor):
 
             async def without_mixer(vad_stop_secs: float) -> AsyncGenerator[Frame, None]:
                 pending_frame: Frame | None = None
+                # The fallback fires once `vad_stop_secs` have passed without an
+                # audio frame. Non-audio frames share this queue (heartbeats
+                # among them, at a shorter period than the fallback), so only
+                # audio moves the reference time; the queue is emptied before
+                # the fallback is considered so frame order is kept.
+                last_audio_time = time.time()
                 while True:
-                    while self._audio_paused:
-                        await self._audio_resume_event.wait()
+                    if self._audio_paused:
+                        while self._audio_paused:
+                            await self._audio_resume_event.wait()
+                        last_audio_time = time.time()
 
                     try:
                         if pending_frame:
                             frame = pending_frame
                             pending_frame = None
                         else:
-                            frame = await asyncio.wait_for(
-                                self._audio_queue.get(), timeout=vad_stop_secs
-                            )
+                            remaining = vad_stop_secs - (time.time() - last_audio_time)
+                            if remaining > 0:
+                                frame = await asyncio.wait_for(
+                                    self._audio_queue.get(), timeout=remaining
+                                )
+                            else:
+                                frame = self._audio_queue.get_nowait()
                             if self._audio_paused:
                                 pending_frame = frame
                                 continue
-                        yield frame
-                        self._audio_queue.task_done()
-                    except TimeoutError:
+                    except (TimeoutError, asyncio.QueueEmpty):
+                        last_audio_time = time.time()
                         if self._audio_paused:
                             continue
                         # Fallback: notify the bot stopped speaking upstream if necessary based on timeout.
                         await self._bot_stopped_speaking()
+                        continue
+                    if isinstance(frame, OutputAudioRawFrame):
+                        last_audio_time = time.time()
+                    yield frame
+                    self._audio_queue.task_done()
 
             async def with_mixer(vad_stop_secs: float) -> AsyncGenerator[Frame, None]:
                 # Caller below only invokes this when `self._mixer` is set.

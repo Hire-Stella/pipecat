@@ -239,13 +239,13 @@ class HuggingFaceSTTService(SegmentedSTTService):
                 await self.stop_processing_metrics()
                 return
 
-            language = (
-                str(self._settings.language)
-                if is_given(self._settings.language) and self._settings.language
-                else None
-            )
+            raw_language = self._settings.language if is_given(self._settings.language) else None
+            # The setting may hold a plain code; the frame only takes the enum.
+            language = raw_language if isinstance(raw_language, Language) else None
 
-            await self._handle_transcription(text, True, language)
+            await self._handle_transcription(
+                text, True, str(raw_language) if raw_language else None
+            )
             logger.debug(f"Transcription: [{text}]")
 
             yield TranscriptionFrame(

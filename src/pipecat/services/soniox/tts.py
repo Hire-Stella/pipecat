@@ -194,6 +194,11 @@ class SonioxTTSService(WebsocketTTSService):
 
         super().__init__(
             text_aggregation_mode=text_aggregation_mode,
+            # Every run_tts payload is appended to one Soniox stream, so the
+            # server sees the concatenation of a turn's sentences. Without this
+            # they arrive glued ("Sam.Who") and Soniox's text normalizer reads
+            # the period as the word "dot" rather than a sentence break.
+            append_trailing_space=True,
             # We emit word-aligned TTSTextFrames from Soniox timestamps as audio
             # plays, so the base class must not push each sentence's text up front.
             push_text_frames=False,
@@ -620,6 +625,10 @@ class SonioxTTSService(WebsocketTTSService):
                 await self._connect()
 
             try:
+                # The eager config send at turn start does not survive a
+                # reconnect (``_disconnect_websocket`` clears the set), and
+                # Soniox rejects text for a stream it has not seen. Idempotent.
+                await self._send_config(context_id)
                 text_msg = {"text": text, "text_end": False, "stream_id": context_id}
                 await self._get_websocket().send(json.dumps(text_msg))
                 await self.start_tts_usage_metrics(text)
