@@ -2060,6 +2060,17 @@
       "location": "pipecat/services/groq/tts.py"
     },
     {
+      "subject": "HuggingFaceLLMService.model",
+      "module": "pipecat.services.huggingface.llm",
+      "kind": "parameter",
+      "deprecated_in": "0.0.105",
+      "removed_in": "2.0.0",
+      "relation": "use_existing",
+      "replacement": "settings=HuggingFaceLLMService.Settings(model=...)",
+      "message": "Use ``settings=HuggingFaceLLMService.Settings(model=...)`` instead. Will be removed in 2.0.0.",
+      "location": "pipecat/services/huggingface/llm.py"
+    },
+    {
       "subject": "HumeTTSService.InputParams",
       "module": "pipecat.services.hume.tts",
       "kind": "class",
@@ -2311,6 +2322,17 @@
       "replacement": null,
       "message": "No replacement. Mem0 2.0.0 removed the ``api_version`` / ``output_format`` parameters from the client. Will be removed in 2.0.0.",
       "location": "pipecat/services/mem0/memory.py"
+    },
+    {
+      "subject": "MiniMaxLLMService.model",
+      "module": "pipecat.services.minimax.llm",
+      "kind": "parameter",
+      "deprecated_in": "0.0.105",
+      "removed_in": "2.0.0",
+      "relation": "use_existing",
+      "replacement": "settings=MiniMaxLLMService.Settings(model=...)",
+      "message": "Use ``settings=MiniMaxLLMService.Settings(model=...)`` instead. Will be removed in 2.0.0.",
+      "location": "pipecat/services/minimax/llm.py"
     },
     {
       "subject": "MiniMaxHttpTTSService.InputParams",
