@@ -85,7 +85,9 @@ class TestBaseOutputTransportFailures(unittest.IsolatedAsyncioTestCase):
                 FrameDirection.DOWNSTREAM,
             )
 
-            for _ in range(20):
+            # Two failed 10 ms writes take ~25 ms locally, but a loaded CI runner
+            # has started the audio task well over 200 ms late, so poll for longer.
+            for _ in range(500):
                 if any(isinstance(frame, CancelTaskFrame) for frame, _ in transport.pushed_frames):
                     break
                 await asyncio.sleep(0.01)

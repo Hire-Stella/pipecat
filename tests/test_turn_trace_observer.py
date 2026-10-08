@@ -5,6 +5,7 @@
 #
 
 import asyncio
+import importlib.util
 import threading
 import unittest
 from unittest.mock import patch
@@ -116,6 +117,7 @@ class TestTurnTraceObserver(unittest.IsolatedAsyncioTestCase):
         """Return finished conversation turns, including their numbered names."""
         return [s for s in self._exporter.get_finished_spans() if "turn.number" in s.attributes]
 
+    @unittest.skipUnless(importlib.util.find_spec("langfuse"), "langfuse is not installed")
     def test_trace_url_can_be_retrieved_for_persistence(self):
         _, _, trace_observer, _ = self._create_observers(conversation_id="persisted-call")
         trace_observer.start_conversation_tracing("persisted-call")
