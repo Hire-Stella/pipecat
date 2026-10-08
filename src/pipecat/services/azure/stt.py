@@ -95,9 +95,7 @@ class AzureSTTSettings(STTSettings):
     """
 
     profanity: AzureProfanity | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    auto_detect_languages: list[str] | None | _NotGiven = field(
-        default_factory=lambda: NOT_GIVEN
-    )
+    auto_detect_languages: list[str] | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
 
 
 class AzureSTTService(STTService):
