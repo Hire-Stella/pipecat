@@ -644,18 +644,21 @@ class SonioxSTTService(WebsocketSTTService):
             if len(heard) < 2:
                 return True
             # ponytail: permanent lock; relock on prolonged silence if that bites.
-            self._locked_speaker = max(heard, key=heard.get)
-            self._caller_level = heard[self._locked_speaker]
-            logger.info(f"{self}: single-speaker mode locked onto speaker {self._locked_speaker}")
+            locked = max(heard, key=lambda s: heard[s])
+            self._locked_speaker = locked
+            self._caller_level = heard[locked]
+            logger.info(f"{self}: single-speaker mode locked onto speaker {locked}")
         keep = self._passes_level(speaker, level)
         # Track the caller's level only from speech clearly at their level, so a
         # quiet mislabelled bystander that slipped through cannot drag it down.
+        caller_level = self._caller_level
         if (
             keep
+            and caller_level is not None
             and speaker == self._locked_speaker
-            and level >= SINGLE_SPEAKER_LEVEL_RATIO * self._caller_level
+            and level >= SINGLE_SPEAKER_LEVEL_RATIO * caller_level
         ):
-            self._caller_level = 0.8 * self._caller_level + 0.2 * level
+            self._caller_level = 0.8 * caller_level + 0.2 * level
         return keep
 
     @traced_stt

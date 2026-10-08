@@ -194,7 +194,7 @@ class AzureSTTService(STTService):
         recognition language — the SDK rejects combining one with an
         AutoDetectSourceLanguageConfig on the recognizer.
         """
-        kwargs = {"subscription": self._api_key}
+        kwargs: dict[str, Any] = {"subscription": self._api_key}
         if self._private_endpoint:
             kwargs["endpoint"] = self._private_endpoint
         else:
