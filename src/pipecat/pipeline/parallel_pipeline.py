@@ -15,7 +15,7 @@ from itertools import chain
 
 from loguru import logger
 
-from pipecat.frames.frames import CancelFrame, EndFrame, Frame, StartFrame
+from pipecat.frames.frames import CancelFrame, EndFrame, Frame, PipelineFlushFrame, StartFrame
 from pipecat.pipeline.base_pipeline import BasePipeline
 from pipecat.pipeline.pipeline import Pipeline, PipelineSink, PipelineSource
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor, FrameProcessorSetup
@@ -170,8 +170,16 @@ class ParallelPipeline(BasePipeline):
         to prevent them from escaping the parallel pipeline before all branches
         have finished processing the lifecycle frame.
         """
-        if frame.id not in self._seen_ids:
-            self._seen_ids.add(frame.id)
+        # A flush probe crosses on every leg of its round trip (down, up, down
+        # again) as the same frame, so dedupe it per leg rather than per id;
+        # otherwise the first leg swallows the rest and the flush never settles.
+        key = (
+            (frame.id, direction, frame.returning)
+            if isinstance(frame, PipelineFlushFrame)
+            else frame.id
+        )
+        if key not in self._seen_ids:
+            self._seen_ids.add(key)
             if self._synchronizing:
                 self._buffered_frames.append((frame, direction))
             else:
