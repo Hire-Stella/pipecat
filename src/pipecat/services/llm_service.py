@@ -2060,8 +2060,24 @@ class LLMService(UserTurnCompletionLLMServiceMixin, AIService, Generic[TAdapter]
     async def _missing_function_call_handler(self, params: FunctionCallParams):
         """Return a terminal tool result when the LLM calls an unknown function."""
         await params.result_callback(
-            self.MISSING_FUNCTION_CALL_MESSAGE_TEMPLATE.format(function_name=params.function_name)
+            self.missing_function_call_message(params.function_name, params.context)
         )
+
+    def missing_function_call_message(self, function_name: str, context) -> str:
+        """Tool result for a call to a function the LLM cannot use right now.
+
+        Names the functions that are advertised, so the next attempt can use an
+        exact name instead of reading the failure as missing information and
+        asking the user again.
+        """
+        message = self.MISSING_FUNCTION_CALL_MESSAGE_TEMPLATE.format(function_name=function_name)
+        names = sorted(self._advertised_tool_names(context) - {function_name})
+        if names:
+            message += (
+                f" The functions you can call now are: {', '.join(names)}."
+                " Use one of these exact names, or reply without a function call."
+            )
+        return message
 
     @staticmethod
     def _advertised_tool_names(context) -> set[str]:

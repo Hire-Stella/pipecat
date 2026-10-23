@@ -347,6 +347,31 @@ class TestLLMService(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(type(recorded_frames[0]), NodeTransitionStartedFrame)
         self.assertEqual(type(recorded_frames[1]), FunctionCallsStartedFrame)
 
+    async def test_missing_function_call_message_names_advertised_functions(self):
+        service = MockLLMService()
+        context = LLMContext(
+            tools=ToolsSchema(
+                standard_tools=[
+                    FunctionSchema(name=name, description="", properties={}, required=[])
+                    for name in ("not_willing_to_share", "details_confirmed")
+                ]
+            )
+        )
+
+        self.assertEqual(
+            service.missing_function_call_message("details_captured", context),
+            "The function `details_captured` is not currently available."
+            " The functions you can call now are: details_confirmed, not_willing_to_share."
+            " Use one of these exact names, or reply without a function call.",
+        )
+        # An advertised name without a handler is not offered back to the LLM.
+        self.assertEqual(
+            service.missing_function_call_message("details_confirmed", context),
+            "The function `details_confirmed` is not currently available."
+            " The functions you can call now are: not_willing_to_share."
+            " Use one of these exact names, or reply without a function call.",
+        )
+
     async def test_missing_function_call_dev_error_logged_as_error(self):
         """Tool advertised to the LLM but missing a handler → logger.error."""
         service = MockLLMService()
